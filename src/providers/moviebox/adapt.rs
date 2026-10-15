@@ -443,6 +443,23 @@ pub fn moviebox_details_json_to_media_details(
     })
 }
 
+fn first_nonempty_string<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn parse_usize_value(value: &serde_json::Value) -> Option<usize> {
+    value
+        .as_u64()
+        .and_then(|number| usize::try_from(number).ok())
+        .or_else(|| value.as_str().and_then(|number| number.parse::<usize>().ok()))
+}
+
 pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
     if let Some(r) = item
         .get("_addon_release")
@@ -451,10 +468,7 @@ pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
         return r;
     }
 
-    let filename = item
-        .get("fileName")
-        .or_else(|| item.get("title"))
-        .and_then(|v| v.as_str())
+    let filename = first_nonempty_string(item, &["fileName", "file_name", "title"])
         .unwrap_or("Unknown Release")
         .to_string();
 
@@ -468,51 +482,34 @@ pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
         }
     });
 
-    let codec = item
-        .get("codecName")
-        .or_else(|| item.get("codec"))
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string());
+    let codec = first_nonempty_string(item, &["codecName", "codec_name", "codec"])
+        .map(|value| value.to_string());
 
-    let language = item
-        .get("language")
-        .or_else(|| item.get("lanName"))
-        .and_then(|l| l.as_str())
-        .map(|s| s.to_string());
+    let language = first_nonempty_string(item, &["language", "lanName", "lan_name"])
+        .map(|value| value.to_string());
 
-    let size_bytes = item.get("size").and_then(|s| {
-        if let Some(n) = s.as_u64() {
-            Some(n)
-        } else if let Some(n) = s.as_i64() {
-            Some(n as u64)
-        } else if let Some(str_val) = s.as_str() {
-            str_val.parse::<u64>().ok()
-        } else {
-            None
-        }
-    });
+    let size_bytes = item
+        .get("size")
+        .or_else(|| item.get("fileSize"))
+        .or_else(|| item.get("file_size"))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|size| size.parse::<u64>().ok()))
+        });
 
-    let season = item.get("se").and_then(|v| {
-        if let Some(n) = v.as_u64() {
-            Some(n as usize)
-        } else if let Some(n) = v.as_i64() {
-            Some(n as usize)
-        } else {
-            v.as_str().and_then(|s| s.parse().ok())
-        }
-    });
+    let season = item
+        .get("se")
+        .or_else(|| item.get("season"))
+        .and_then(parse_usize_value);
 
-    let episode = item.get("ep").and_then(|v| {
-        if let Some(n) = v.as_u64() {
-            Some(n as usize)
-        } else if let Some(n) = v.as_i64() {
-            Some(n as usize)
-        } else {
-            v.as_str().and_then(|s| s.parse().ok())
-        }
-    });
+    let episode = item
+        .get("ep")
+        .or_else(|| item.get("episode"))
+        .and_then(parse_usize_value);
     let resource_id = item
         .get("resourceId")
+        .or_else(|| item.get("resource_id"))
         .or_else(|| item.get("id"))
         .and_then(|v| {
             if let Some(num) = v.as_i64() {
@@ -525,12 +522,21 @@ pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
         });
 
     let mut mirrors = Vec::new();
-    let resource_link = item
-        .get("resourceLink")
-        .or_else(|| item.get("url"))
-        .and_then(|l| l.as_str())
-        .filter(|s| !s.is_empty())
-        .filter(|s| !is_deprecation_notice_url(s));
+    let resource_link = first_nonempty_string(
+        item,
+        &[
+            "resourceLink",
+            "resource_link",
+            "directUrl",
+            "direct_url",
+            "downloadUrl",
+            "download_url",
+            "playUrl",
+            "play_url",
+            "url",
+        ],
+    )
+    .filter(|url| !is_deprecation_notice_url(url));
     if let Some(link) = resource_link {
         let label = item
             .get("uploadBy")
@@ -652,67 +658,132 @@ pub fn resolve_dash_manifest_from_policy(sign_cookie: &str) -> Option<String> {
     None
 }
 
+fn unwrap_moviebox_data(mut payload: &serde_json::Value) -> &serde_json::Value {
+    for _ in 0..3 {
+        let Some(data) = payload.get("data").filter(|data| !data.is_null()) else {
+            break;
+        };
+        payload = data;
+    }
+    payload
+}
+
+fn parse_resolution(value: &str) -> Option<u32> {
+    let digits = value.trim().trim_end_matches('p').trim_end_matches('P');
+    let resolution = digits.parse::<u32>().ok()?;
+    (resolution > 0).then_some(resolution)
+}
+
+fn parse_resolution_value(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|resolution| u32::try_from(resolution).ok())
+        .or_else(|| value.as_str().and_then(parse_resolution))
+}
+
+fn parse_moviebox_resolutions(value: Option<&serde_json::Value>) -> Vec<u32> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+
+    let mut resolutions = match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(parse_resolution_value)
+            .collect(),
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|resolution| u32::try_from(resolution).ok())
+            .into_iter()
+            .collect(),
+        serde_json::Value::String(values) => values
+            .split(',')
+            .filter_map(parse_resolution)
+            .collect(),
+        _ => Vec::new(),
+    };
+    resolutions.retain(|resolution| *resolution > 0);
+    resolutions.sort_unstable_by(|left, right| right.cmp(left));
+    resolutions.dedup();
+    resolutions
+}
+
 pub fn moviebox_play_info_json_to_releases(
     payload: &serde_json::Value,
     season: usize,
     episode: usize,
     user_agent: &str,
 ) -> Vec<Release> {
-    let data = payload.get("data").unwrap_or(payload);
+    let data = unwrap_moviebox_data(payload);
+    let data = data
+        .get("playInfo")
+        .or_else(|| data.get("play_info"))
+        .unwrap_or(data);
     let raw_title_prefix = data
         .get("title")
         .and_then(|t| t.as_str())
         .unwrap_or("MovieBox Stream");
     let title_prefix = crate::providers::moviebox::title::clean_moviebox_title(raw_title_prefix);
-    let Some(streams) = data.get("streams").and_then(|s| s.as_array()) else {
+    let Some(streams) = data
+        .get("streams")
+        .or_else(|| data.get("streamList"))
+        .or_else(|| data.get("stream_list"))
+        .or_else(|| data.get("list"))
+        .and_then(|streams| streams.as_array())
+        .or_else(|| data.as_array())
+    else {
         return Vec::new();
     };
 
     let mut releases = Vec::new();
 
     for stream in streams {
-        let stream_id = stream.get("id").and_then(|v| {
-            if let Some(n) = v.as_i64() {
-                Some(n.to_string())
-            } else if let Some(n) = v.as_u64() {
-                Some(n.to_string())
-            } else {
-                v.as_str().map(|s| s.to_string())
-            }
-        });
+        let stream_id = stream
+            .get("id")
+            .or_else(|| stream.get("streamId"))
+            .or_else(|| stream.get("stream_id"))
+            .and_then(|v| {
+                if let Some(n) = v.as_i64() {
+                    Some(n.to_string())
+                } else if let Some(n) = v.as_u64() {
+                    Some(n.to_string())
+                } else {
+                    v.as_str().map(|s| s.to_string())
+                }
+            });
         let format_type = stream
             .get("format")
             .and_then(|f| f.as_str())
             .unwrap_or("MP4");
-        let codec = stream
-            .get("codecName")
-            .or_else(|| stream.get("codec"))
-            .and_then(|c| c.as_str())
-            .map(|s| s.to_string());
-        let size_bytes = stream.get("size").and_then(|s| {
-            if let Some(n) = s.as_u64() {
-                Some(n)
-            } else if let Some(n) = s.as_i64() {
-                Some(n as u64)
-            } else if let Some(str_val) = s.as_str() {
-                str_val.parse::<u64>().ok()
-            } else {
-                None
-            }
-        });
+        let codec = first_nonempty_string(stream, &["codecName", "codec_name", "codec"])
+            .map(|value| value.to_string());
+        let size_bytes = stream
+            .get("size")
+            .or_else(|| stream.get("fileSize"))
+            .or_else(|| stream.get("file_size"))
+            .and_then(|s| {
+                s.as_u64()
+                    .or_else(|| s.as_str().and_then(|value| value.parse::<u64>().ok()))
+            });
 
-        let resolutions_str = stream
+        let resolutions_value = stream
             .get("resolutions")
-            .or_else(|| data.get("displayResolutions"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("1080,720,480");
+            .or_else(|| stream.get("resolutionList"))
+            .or_else(|| stream.get("resolution_list"))
+            .or_else(|| data.get("displayResolutions"));
+        let mut parsed_resolutions = parse_moviebox_resolutions(resolutions_value);
+        if parsed_resolutions.is_empty() {
+            parsed_resolutions = vec![1080, 720, 480];
+        }
 
-        let sign_cookie = stream
-            .get("signCookie")
-            .and_then(|c| c.as_str())
+        let sign_cookie = first_nonempty_string(stream, &["signCookie", "sign_cookie"])
             .unwrap_or("");
 
-        let stream_url = stream.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let stream_url = first_nonempty_string(
+            stream,
+            &["url", "streamUrl", "stream_url", "playUrl", "play_url"],
+        )
+        .unwrap_or("");
 
         let manifest_url = resolve_dash_manifest_from_policy(sign_cookie).or_else(|| {
             if is_deprecation_notice_url(stream_url) {
@@ -741,18 +812,7 @@ pub fn moviebox_play_info_json_to_releases(
                 .join("; ");
             headers.push(("Cookie".to_string(), clean_cookie));
         }
-        let mut parsed_resolutions = resolutions_str
-            .split(',')
-            .filter_map(|s| s.trim().parse::<u32>().ok())
-            .collect::<Vec<_>>();
-        parsed_resolutions.sort_unstable_by(|a, b| b.cmp(a));
-        parsed_resolutions.dedup();
-
-        let res_list = if parsed_resolutions.is_empty() {
-            vec![1080]
-        } else {
-            parsed_resolutions
-        };
+        let res_list = parsed_resolutions;
 
         let codec_disp = codec.as_deref().unwrap_or(format_type);
 
@@ -801,13 +861,17 @@ pub fn moviebox_play_info_json_to_releases(
 }
 
 pub fn moviebox_resource_json_to_releases(payload: &serde_json::Value) -> Vec<Release> {
-    let items = if let Some(list) = payload.get("list").and_then(|l| l.as_array()) {
-        list.as_slice()
-    } else if let Some(arr) = payload.as_array() {
-        arr.as_slice()
-    } else {
-        &[]
-    };
+    let data = unwrap_moviebox_data(payload);
+    let items = data
+        .get("list")
+        .or_else(|| data.get("resources"))
+        .or_else(|| data.get("resourceList"))
+        .or_else(|| data.get("resource_list"))
+        .or_else(|| data.get("items"))
+        .and_then(|items| items.as_array())
+        .or_else(|| data.as_array())
+        .map(|items| items.as_slice())
+        .unwrap_or(&[]);
     items
         .iter()
         .map(moviebox_resource_item_to_release)
@@ -1370,5 +1434,66 @@ mod tests {
         let releases = moviebox_resource_json_to_releases(&payload);
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].filename, "Valid Stream");
+    }
+
+    #[test]
+    fn test_moviebox_play_info_accepts_nested_and_alternate_api_shapes() {
+        let payload = json!({
+            "data": {
+                "data": {
+                    "playInfo": {
+                        "title": "Nested Movie",
+                        "streamList": [{
+                            "streamId": "stream-1",
+                            "codec": "h264",
+                            "resolutionList": [1080, "720p"],
+                            "url": "",
+                            "streamUrl": "https://cdn.example.com/nested.mp4",
+                            "sign_cookie": ""
+                        }]
+                    }
+                }
+            }
+        });
+
+        let releases = moviebox_play_info_json_to_releases(&payload, 0, 0, "TestAgent/1.0");
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].quality.as_deref(), Some("1080p"));
+        assert_eq!(releases[1].quality.as_deref(), Some("720p"));
+        assert_eq!(releases[0].resource_id.as_deref(), Some("stream-1"));
+        assert_eq!(
+            releases[0].direct_url(),
+            Some("https://cdn.example.com/nested.mp4")
+        );
+    }
+
+    #[test]
+    fn test_moviebox_resource_adapter_accepts_nested_resource_arrays() {
+        let payload = json!({
+            "data": {
+                "data": {
+                    "resources": [{
+                        "resourceId": "resource-1",
+                        "file_name": "Nested Resource",
+                        "resolution": "720p",
+                        "season": "2",
+                        "episode": 3,
+                        "resourceLink": null,
+                        "directUrl": "https://cdn.example.com/resource.mp4"
+                    }]
+                }
+            }
+        });
+
+        let releases = moviebox_resource_json_to_releases(&payload);
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].filename, "Nested Resource");
+        assert_eq!(releases[0].quality.as_deref(), Some("720p"));
+        assert_eq!(releases[0].season, Some(2));
+        assert_eq!(releases[0].episode, Some(3));
+        assert_eq!(
+            releases[0].direct_url(),
+            Some("https://cdn.example.com/resource.mp4")
+        );
     }
 }

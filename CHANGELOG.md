@@ -7,6 +7,9 @@
   - Reset legacy Android player defaults in graphical X11 and Wayland sessions so native Linux players take precedence over external Android intent dialogs.
   - Prioritized native Linux media player paths over foreign container fallbacks on Linux systems and preserved dynamic auto-player resolution for unconfigured sessions.
 - **Providers & Stream Resolution**:
+  - Accepted nested/alternate MovieBox play-info and resource response shapes, including alternate stream URLs, resource URLs, and resolution fields.
+  - Preserved usable resource releases when play-info fails and surfaced API/network failures instead of misreporting them as an empty stream list.
+  - Parsed MovieBox business-level API errors and refreshed visitor sessions after API-level 401/403 responses.
   - Filtered out unhosted MovieBox `/hls/` signed cookie targets in manifest resolution, which stops unplayable H.264 stream entries from failing with HTTP 404 during downloads or media playback.
 - **Download Engine & Batch Queue**:
   - Fixed season batch downloads by arming `is_waiting_for_download_stream` during queue steps, eliminating immediate empty-list download calls that aborted multi-episode queues.

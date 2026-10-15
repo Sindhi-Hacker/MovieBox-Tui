@@ -6,9 +6,12 @@ pub mod title;
 
 pub use title::clean_moviebox_title;
 
-pub const STREAM_REFERER: &str = "https://sportslive.wine";
 use crate::providers::models::{CatalogItem, MediaDetails, ProviderError, ProviderKind};
 use crate::providers::{Provider, ProviderCapabilities};
+use client::{MovieBoxClient, ScraperError};
+use serde_json::{Value, json};
+
+pub const STREAM_REFERER: &str = "https://sportslive.wine";
 
 impl From<ScraperError> for ProviderError {
     fn from(err: ScraperError) -> Self {
@@ -17,6 +20,11 @@ impl From<ScraperError> for ProviderError {
             ScraperError::ApiStatus(429) => ProviderError::RateLimited(None),
             ScraperError::ApiStatus(404) => ProviderError::NotFound,
             ScraperError::ApiStatus(s) => ProviderError::Unavailable(format!("HTTP status {s}")),
+            ScraperError::ApiCode { code: 429, .. } => ProviderError::RateLimited(None),
+            ScraperError::ApiCode { code: 404, .. } => ProviderError::NotFound,
+            ScraperError::ApiCode { code, message } => {
+                ProviderError::Unavailable(format!("API error {code}: {message}"))
+            }
             ScraperError::HostsExhausted => {
                 ProviderError::Unavailable("All hosts exhausted".to_string())
             }
@@ -78,29 +86,51 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
             )
         );
 
-        let mut releases = Vec::new();
-        let mut seen_urls = std::collections::HashSet::new();
+        merge_stream_responses(
+            play_info_res,
+            resources_res,
+            season,
+            episode,
+            self.user_agent(),
+        )
+    }
+}
 
-        if let Ok(json) = play_info_res {
-            for rel in adapt::moviebox_play_info_json_to_releases(
-                &json,
-                season,
-                episode,
-                self.user_agent(),
-            ) {
-                if let Some(url) = rel.direct_url() {
+fn merge_stream_responses(
+    play_info_res: Result<Value, ScraperError>,
+    resources_res: Result<Value, ScraperError>,
+    season: usize,
+    episode: usize,
+    user_agent: &str,
+) -> Result<Vec<crate::providers::models::Release>, ProviderError> {
+    let mut releases = Vec::new();
+    let mut seen_urls = std::collections::HashSet::new();
+    let mut endpoint_errors = Vec::new();
+
+    match play_info_res {
+        Ok(json) => {
+            for release in
+                adapt::moviebox_play_info_json_to_releases(&json, season, episode, user_agent)
+            {
+                if let Some(url) = release.direct_url() {
                     let base = url.split('?').next().unwrap_or(url).to_string();
                     if !base.is_empty() {
                         seen_urls.insert(base);
                     }
                 }
-                releases.push(rel);
+                releases.push(release);
             }
         }
+        Err(error) => {
+            log::warn!("MovieBox play-info request failed: {error}");
+            endpoint_errors.push(("play-info", error));
+        }
+    }
 
-        if let Ok(res_json) = resources_res {
-            for rel in adapt::moviebox_resource_json_to_releases(&res_json) {
-                if let Some(url) = rel.direct_url() {
+    match resources_res {
+        Ok(json) => {
+            for release in adapt::moviebox_resource_json_to_releases(&json) {
+                if let Some(url) = release.direct_url() {
                     let base = url.split('?').next().unwrap_or(url).to_string();
                     if !base.is_empty() && seen_urls.contains(&base) {
                         continue;
@@ -108,33 +138,52 @@ impl crate::providers::ReleaseProvider for client::MovieBoxClient {
                     seen_urls.insert(base);
                 }
                 if (season == 0 && episode == 0)
-                    || (rel.season == Some(season) && rel.episode == Some(episode))
-                    || (rel.season.is_none() && rel.episode.is_none())
+                    || (release.season == Some(season) && release.episode == Some(episode))
+                    || (release.season.is_none() && release.episode.is_none())
                 {
-                    releases.push(rel);
+                    releases.push(release);
                 }
             }
         }
+        Err(error) => {
+            log::warn!("MovieBox resource request failed: {error}");
+            endpoint_errors.push(("resource", error));
+        }
+    }
 
-        if releases.is_empty() {
+    if releases.is_empty() {
+        if endpoint_errors.is_empty() {
             return Err(ProviderError::Unavailable(
                 "No stream sources available".to_string(),
             ));
         }
-
-        releases.sort_by(|left, right| {
-            right
-                .resolution_u64()
-                .cmp(&left.resolution_u64())
-                .then_with(|| right.size_bytes.cmp(&left.size_bytes))
-        });
-
-        Ok(releases)
+        return Err(stream_endpoint_error(endpoint_errors));
     }
+
+    releases.sort_by(|left, right| {
+        right
+            .resolution_u64()
+            .cmp(&left.resolution_u64())
+            .then_with(|| right.size_bytes.cmp(&left.size_bytes))
+    });
+
+    Ok(releases)
 }
 
-use client::{MovieBoxClient, ScraperError};
-use serde_json::{Value, json};
+fn stream_endpoint_error(errors: Vec<(&'static str, ScraperError)>) -> ProviderError {
+    let mut errors = errors.into_iter();
+    let Some((first_endpoint, first_error)) = errors.next() else {
+        return ProviderError::Unavailable("No stream sources available".to_string());
+    };
+
+    if let Some((second_endpoint, second_error)) = errors.next() {
+        return ProviderError::Unavailable(format!(
+            "MovieBox stream lookup failed ({first_endpoint}: {first_error}; {second_endpoint}: {second_error})"
+        ));
+    }
+
+    first_error.into()
+}
 
 impl MovieBoxClient {
     pub async fn get_play_info(
@@ -372,6 +421,77 @@ mod tests {
         assert_eq!(
             path,
             "/wefeed-mobile-bff/subject-api/resource?subjectId=67890&se=1&ep=10&page=2&perPage=20&resolution=1080"
+        );
+    }
+
+    #[test]
+    fn test_failed_moviebox_stream_request_is_not_misreported_as_no_streams() {
+        let error = merge_stream_responses(
+            Err(ScraperError::ApiStatus(502)),
+            Ok(json!({ "list": [] })),
+            0,
+            0,
+            "TestAgent/1.0",
+        )
+        .expect_err("failed play-info request should be surfaced");
+
+        assert!(error.to_string().contains("HTTP status 502"));
+        assert!(!error.to_string().contains("No stream sources available"));
+    }
+
+    #[test]
+    fn test_both_moviebox_stream_endpoint_errors_are_reported_together() {
+        let error = merge_stream_responses(
+            Err(ScraperError::HostsExhausted),
+            Err(ScraperError::ApiStatus(502)),
+            0,
+            0,
+            "TestAgent/1.0",
+        )
+        .expect_err("both endpoint failures should be surfaced");
+
+        let message = error.to_string();
+        assert!(message.contains("play-info: All hosts exhausted"));
+        assert!(message.contains("resource: API error status: 502"));
+        assert!(!message.contains("No stream sources available"));
+    }
+
+    #[test]
+    fn test_empty_successful_moviebox_responses_report_no_streams() {
+        let error = merge_stream_responses(
+            Ok(json!({ "streams": [] })),
+            Ok(json!({ "list": [] })),
+            0,
+            0,
+            "TestAgent/1.0",
+        )
+        .expect_err("empty successful responses should report an empty result");
+
+        assert!(error.to_string().contains("No stream sources available"));
+    }
+
+    #[test]
+    fn test_resource_streams_are_kept_when_play_info_fails() {
+        let result = merge_stream_responses(
+            Err(ScraperError::HostsExhausted),
+            Ok(json!({
+                "list": [{
+                    "resourceId": "resource-1",
+                    "fileName": "Example Movie 1080p",
+                    "resolution": 1080,
+                    "resourceLink": "https://cdn.example.com/example.mp4"
+                }]
+            })),
+            0,
+            0,
+            "TestAgent/1.0",
+        )
+        .expect("valid resource links should remain usable when play-info fails");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].direct_url(),
+            Some("https://cdn.example.com/example.mp4")
         );
     }
 }
