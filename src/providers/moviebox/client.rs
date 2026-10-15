@@ -25,6 +25,8 @@ pub enum ScraperError {
     Reqwest(#[from] reqwest::Error),
     #[error("API error status: {0}")]
     ApiStatus(u16),
+    #[error("API error code {code}: {message}")]
+    ApiCode { code: i64, message: String },
     #[error("All hosts exhausted")]
     HostsExhausted,
     #[error("JSON error: {0}")]
@@ -212,7 +214,8 @@ impl MovieBoxClient {
             .request_hosts(method, path_and_query, body, Some(&token))
             .await
         {
-            Err(ScraperError::ApiStatus(401 | 403)) => {
+            Err(ScraperError::ApiStatus(401 | 403))
+            | Err(ScraperError::ApiCode { code: 401 | 403, .. }) => {
                 self.invalidate_session();
                 let fresh_token = self.ensure_session().await?;
                 self.request_hosts(method, path_and_query, body, Some(&fresh_token))
@@ -237,6 +240,7 @@ impl MovieBoxClient {
     ) -> Result<Value, ScraperError> {
         let start_idx = self.active_base_idx.load(Ordering::Relaxed);
         let mut backoff_ms: u64 = 50;
+        let mut last_api_error = None;
 
         for i in 0..HOST_POOL.len() {
             if i > 0 {
@@ -295,6 +299,17 @@ impl MovieBoxClient {
 
                     match self.parse_response(resp).await {
                         Ok(val) => return Ok(val),
+                        Err(error @ ScraperError::ApiCode { code: 401 | 403, .. }) => {
+                            return Err(error);
+                        }
+                        Err(error @ ScraperError::ApiCode { .. }) => {
+                            log::warn!(
+                                "moviebox host {idx} returned API error: {error} [{}]",
+                                crate::logging::sanitize_url(&url)
+                            );
+                            last_api_error = Some(error);
+                            continue;
+                        }
                         Err(error) => {
                             log::warn!(
                                 "moviebox host {idx} parse failed: {error} [{}]",
@@ -317,7 +332,7 @@ impl MovieBoxClient {
         }
 
         log::error!("moviebox: all hosts exhausted for [redacted]");
-        Err(ScraperError::HostsExhausted)
+        Err(last_api_error.unwrap_or(ScraperError::HostsExhausted))
     }
 
     async fn parse_response(&self, resp: Response) -> Result<Value, ScraperError> {
@@ -340,17 +355,68 @@ impl MovieBoxClient {
                 }
             };
 
-        if let Some(data) = body_val.get("data") {
-            Ok(data.clone())
-        } else {
-            Ok(body_val)
-        }
+        unwrap_api_payload(body_val)
     }
+}
+
+fn unwrap_api_payload(body: Value) -> Result<Value, ScraperError> {
+    let code = body.get("code").and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+            .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+    });
+
+    if let Some(code) = code.filter(|code| *code != 0 && *code != 200) {
+        let raw_message = body
+            .get("message")
+            .or_else(|| body.get("msg"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .unwrap_or("request rejected");
+        let message = raw_message.chars().take(240).collect();
+        return Err(ScraperError::ApiCode { code, message });
+    }
+
+    Ok(body.get("data").cloned().unwrap_or(body))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unwrap_api_payload_accepts_numeric_and_string_success_codes() {
+        for body in [
+            serde_json::json!({ "code": 0, "data": { "streams": [] } }),
+            serde_json::json!({ "code": 200, "data": { "streams": [] } }),
+            serde_json::json!({ "code": "0", "data": { "streams": [] } }),
+        ] {
+            assert_eq!(
+                unwrap_api_payload(body).expect("successful API response"),
+                serde_json::json!({ "streams": [] })
+            );
+        }
+    }
+
+    #[test]
+    fn test_unwrap_api_payload_surfaces_application_errors() {
+        let error = unwrap_api_payload(serde_json::json!({
+            "code": 401,
+            "message": "visitor token expired",
+            "data": null
+        }))
+        .expect_err("API-level errors must not become empty stream results");
+
+        assert!(matches!(
+            error,
+            ScraperError::ApiCode {
+                code: 401,
+                message
+            } if message == "visitor token expired"
+        ));
+    }
 
     #[tokio::test]
     async fn test_client_in_memory_session_reuse() {
